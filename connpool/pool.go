@@ -12,10 +12,10 @@ import (
 
 var (
 	// ErrClosed performs any operation on the closed publisher will return this error.
-	ErrClosed = errors.New("amqp: connection pool is closed")
+	ErrClosed = errors.New("amqpx: connection pool is closed")
 
 	// ErrPoolTimeout timed out waiting to get a connection from the connection pool.
-	ErrPoolTimeout = errors.New("amqp: connection pool timeout")
+	ErrPoolTimeout = errors.New("amqpx: connection pool timeout")
 )
 
 var timers = sync.Pool{

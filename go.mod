@@ -1,4 +1,4 @@
-module github.com/quarks-tech/amqp
+module github.com/quarks-tech/amqpx
 
 go 1.17
 

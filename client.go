@@ -1,10 +1,10 @@
-package amqp
+package amqpx
 
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
+	"log"
 	"math/rand"
 	"net"
 	"sync/atomic"
@@ -12,7 +12,7 @@ import (
 
 	"github.com/streadway/amqp"
 
-	"github.com/quarks-tech/amqp/connpool"
+	"github.com/quarks-tech/amqpx/connpool"
 )
 
 type Command func(ctx context.Context, conn *connpool.Conn) error
@@ -138,7 +138,7 @@ func (c *Client) Close() error {
 
 func retryBackoff(retry int, minBackoff, maxBackoff time.Duration) time.Duration {
 	if retry < 0 {
-		panic("not reached")
+		panic("amqpx: not reached")
 	}
 	if minBackoff == 0 {
 		return 0
@@ -172,7 +172,7 @@ func sleepWithContext(ctx context.Context, dur time.Duration) error {
 
 func isBadConnErr(err error, allowTimeout bool) bool {
 	if err != nil {
-		fmt.Printf("1 %s", err)
+		log.Printf("amqpx: 1 %s", err)
 	}
 
 	switch err {
@@ -202,7 +202,7 @@ func isBadConnErr(err error, allowTimeout bool) bool {
 
 func shouldRetry(err error, retryTimeout bool) bool {
 	if err != nil {
-		fmt.Printf("2 %s", err)
+		log.Printf("amqpx: 2 %s", err)
 	}
 
 	switch err {

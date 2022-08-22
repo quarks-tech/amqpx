@@ -1,12 +1,13 @@
-package amqp
+package amqpx
 
 import (
+	"fmt"
 	"runtime"
 	"time"
 
 	"github.com/streadway/amqp"
 
-	"github.com/quarks-tech/amqp/connpool"
+	"github.com/quarks-tech/amqpx/connpool"
 )
 
 type Limiter interface {
@@ -116,13 +117,13 @@ func newConnPool(cfg *Config) *connpool.ConnPool {
 		Dialer: func() (*amqp.Connection, *amqp.Channel, error) {
 			conn, err := amqp.DialConfig("amqp://"+cfg.Address, cfg.AMQP)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("amqpx: create connection: %w", err)
 			}
 
 			ch, err := conn.Channel()
 			if err != nil {
 				_ = conn.Close()
-				return nil, nil, err
+				return nil, nil, fmt.Errorf("amqpx: create chanel: %w", err)
 			}
 
 			return conn, ch, nil
