@@ -207,9 +207,10 @@ dials; those calls also return `connpool.ErrClosed`. A second `Close` returns
 connection closes, so callers can inspect the result with `errors.Is` or
 `errors.As`.
 
-## Unsupported automatic recovery
+## Automatic recovery must remain disabled
 
-Do not enable the experimental `amqp091-go` v1.12 automatic recovery feature:
+The experimental `amqp091-go` v1.12 automatic recovery feature must remain
+disabled. `NewClient` panics when `Config.AMQP.Recovery` is non-nil:
 
 ```go
 cfg := amqpx.Config{

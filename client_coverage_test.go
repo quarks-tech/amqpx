@@ -183,28 +183,28 @@ func TestRetryBackoffBounds(t *testing.T) {
 
 	t.Run("jittered", func(t *testing.T) {
 		const (
-			min = 10 * time.Millisecond
-			max = 500 * time.Millisecond
+			minBackoff = 10 * time.Millisecond
+			maxBackoff = 500 * time.Millisecond
 		)
 		for range 100 {
-			got := retryBackoff(2, min, max)
-			if got < min || got >= 5*min {
-				t.Fatalf("retryBackoff() = %s, want [%s, %s)", got, min, 5*min)
+			got := retryBackoff(2, minBackoff, maxBackoff)
+			if got < minBackoff || got >= 5*minBackoff {
+				t.Fatalf("retryBackoff() = %s, want [%s, %s)", got, minBackoff, 5*minBackoff)
 			}
 		}
 	})
 
 	t.Run("capped", func(t *testing.T) {
-		const max = 25 * time.Millisecond
-		if got := retryBackoff(8, max, max); got != max {
-			t.Fatalf("retryBackoff() = %s, want cap %s", got, max)
+		const maxBackoff = 25 * time.Millisecond
+		if got := retryBackoff(8, maxBackoff, maxBackoff); got != maxBackoff {
+			t.Fatalf("retryBackoff() = %s, want cap %s", got, maxBackoff)
 		}
 	})
 
 	t.Run("overflow", func(t *testing.T) {
-		const max = time.Second
-		if got := retryBackoff(63, time.Millisecond, max); got != max {
-			t.Fatalf("retryBackoff() = %s, want overflow cap %s", got, max)
+		const maxBackoff = time.Second
+		if got := retryBackoff(63, time.Millisecond, maxBackoff); got != maxBackoff {
+			t.Fatalf("retryBackoff() = %s, want overflow cap %s", got, maxBackoff)
 		}
 	})
 

@@ -210,6 +210,7 @@ func retryBackoff(retry int, minBackoff, maxBackoff time.Duration) time.Duration
 		return maxBackoff
 	}
 
+	//nolint:gosec // Retry jitter does not require cryptographic randomness.
 	d = minBackoff + time.Duration(rand.Int64N(int64(d)))
 
 	if d > maxBackoff || d < minBackoff {
