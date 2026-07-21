@@ -14,7 +14,8 @@
 // indefinitely for the command goroutine. Commands must honor the supplied
 // context and must not leave work running in the background.
 //
-// The experimental automatic Recovery feature in amqp091-go v1.12 is not
-// supported. NewClient panics when Config.AMQP.Recovery is non-nil so that
-// amqpx alone owns connection replacement through pool removal and redial.
+// The experimental automatic connection, channel, and topology Recovery
+// feature in amqp091-go v1.13 is not supported. NewClient panics when
+// Config.AMQP.Recovery is non-nil so that amqpx alone owns connection
+// replacement through pool removal and redial.
 package amqpx

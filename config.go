@@ -28,15 +28,16 @@ type Limiter interface {
 }
 
 // Config controls AMQP connection setup, retry behavior, and connection
-// pooling. NewClient copies Config and its top-level mutable AMQP containers;
-// values referenced inside interfaces, maps, and slices remain caller-owned.
+// pooling. NewClient copies Config, its top-level mutable AMQP containers, and
+// built-in PlainAuth and AMQPlainAuth credentials. Custom interface values and
+// values nested inside maps remain caller-owned.
 type Config struct {
 	// Address is an AMQP URI with an optional amqp:// or amqps:// scheme.
 	Address string
 
 	// AMQP configures the underlying amqp091-go connection. Experimental
-	// connection recovery must remain disabled because the pool owns connection
-	// replacement.
+	// connection, channel, and topology recovery must remain disabled because
+	// the pool owns connection replacement.
 	AMQP amqp.Config
 
 	// Maximum number of retries before giving up.

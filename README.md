@@ -5,13 +5,13 @@
 Each pooled item owns one AMQP connection and one channel. Callers borrow that
 pair through `Client.Process` for the duration of a command.
 
-The current module requires Go 1.26.4 or newer and uses `amqp091-go` v1.12.0.
+The current module requires Go 1.26.4 or newer and uses `amqp091-go` v1.13.0.
 
 > [!IMPORTANT]
-> `amqp091-go` v1.12.0 includes experimental automatic connection and channel
-> recovery. `amqpx` does not support that feature: `NewClient` panics when
-> `Config.AMQP.Recovery` is non-nil. Leave it nil and let `amqpx` discard failed
-> connections and redial through its pool.
+> `amqp091-go` v1.13.0 includes experimental automatic connection, channel,
+> and topology recovery. `amqpx` does not support that feature: `NewClient`
+> panics when `Config.AMQP.Recovery` is non-nil. Leave it nil and let `amqpx`
+> discard failed connections and redial through its pool.
 
 ## Install
 
@@ -79,8 +79,10 @@ caller's responsibility.
 
 `NewClient` accepts a nil config. Otherwise it snapshots the supplied `Config`
 and completes defaults on its private copy. The snapshot clones `AMQP.SASL`,
-`AMQP.Properties`, and `AMQP.TLSClientConfig`. These are shallow snapshots:
-objects referenced through interface or pointer elements, nested property
+`AMQP.Properties`, and `AMQP.TLSClientConfig`. It also copies built-in
+`*amqp.PlainAuth` and `*amqp.AMQPlainAuth` values so amqp091-go v1.13 can erase
+its per-connection password after authentication without mutating caller or
+future-dial credentials. Custom authentication implementations, nested property
 values, functions, and a custom `Limiter` remain shared and must be safe for
 concurrent use.
 
@@ -209,8 +211,9 @@ connection closes, so callers can inspect the result with `errors.Is` or
 
 ## Automatic recovery must remain disabled
 
-The experimental `amqp091-go` v1.12 automatic recovery feature must remain
-disabled. `NewClient` panics when `Config.AMQP.Recovery` is non-nil:
+The experimental `amqp091-go` v1.13 automatic connection, channel, and topology
+recovery feature must remain disabled. `NewClient` panics when
+`Config.AMQP.Recovery` is non-nil:
 
 ```go
 cfg := amqpx.Config{
