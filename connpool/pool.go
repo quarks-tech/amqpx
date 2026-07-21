@@ -11,20 +11,25 @@ import (
 )
 
 var (
-	// ErrClosed performs any operation on the closed publisher will return this error.
+	// ErrClosed is returned when an operation cannot run because the pool is closed.
 	ErrClosed = errors.New("amqpx: connection pool is closed")
 
-	// ErrPoolTimeout timed out waiting to get a connection from the connection pool.
+	// ErrPoolTimeout is returned when Get times out waiting for a pool turn.
 	ErrPoolTimeout = errors.New("amqpx: connection pool timeout")
 )
 
 var timers = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		t := time.NewTimer(time.Hour)
 		t.Stop()
 		return t
 	},
 }
+
+const (
+	defaultMinIdleRetryDelay = time.Second
+	discardCloseTimeout      = 100 * time.Millisecond
+)
 
 // Stats contains pool state information and accumulated stats.
 type Stats struct {
@@ -37,6 +42,7 @@ type Stats struct {
 	StaleConns uint32 // number of stale connections removed from the pool
 }
 
+// Pooler is the connection-pool contract implemented by ConnPool.
 type Pooler interface {
 	NewConn() (*Conn, error)
 	CloseConn(*Conn) error
@@ -52,15 +58,31 @@ type Pooler interface {
 	Close() error
 }
 
+// Options configures a ConnPool. New validates and copies Options, so later
+// caller mutations do not affect the pool.
 type Options struct {
-	Dialer             func() (*amqp.Connection, *amqp.Channel, error)
-	OnClose            func(*Conn) error
-	PoolFIFO           bool
-	PoolSize           int
-	MinIdleConns       int
-	MaxConnAge         time.Duration
-	PoolTimeout        time.Duration
-	IdleTimeout        time.Duration
+	// Dialer creates an AMQP connection and channel. It is retained for
+	// compatibility and cannot be interrupted by context cancellation.
+	Dialer func() (*amqp.Connection, *amqp.Channel, error)
+	// DialerContext creates an AMQP connection and channel with cancellation.
+	// When set, it takes precedence over Dialer.
+	DialerContext func(context.Context) (*amqp.Connection, *amqp.Channel, error)
+	// OnClose runs at most once when the pool processes a connection close. Its
+	// error is joined with the connection close error. It must return promptly.
+	OnClose func(*Conn) error
+	// PoolFIFO selects FIFO idle checkout; false selects LIFO.
+	PoolFIFO bool
+	// PoolSize is the positive maximum number of pooled leases and dials.
+	PoolSize int
+	// MinIdleConns is the desired prewarmed idle count, from zero to PoolSize.
+	MinIdleConns int
+	// MaxConnAge retires connections at or beyond this age when positive.
+	MaxConnAge time.Duration
+	// PoolTimeout bounds how long Get waits for a pool turn and must not be negative.
+	PoolTimeout time.Duration
+	// IdleTimeout retires connections idle for at least this duration when positive.
+	IdleTimeout time.Duration
+	// IdleCheckFrequency controls background idle reaping when positive.
 	IdleCheckFrequency time.Duration
 }
 
@@ -68,10 +90,11 @@ type lastDialErrorWrap struct {
 	err error
 }
 
+// ConnPool is a concurrency-safe bounded pool of AMQP connections.
 type ConnPool struct {
 	opt *Options
 
-	dialErrorsNum uint32 // atomic
+	dialErrorsNum atomic.Uint32
 
 	lastDialError atomic.Value
 
@@ -82,16 +105,43 @@ type ConnPool struct {
 	idleConns    []*Conn
 	poolSize     int
 	idleConnsLen int
+	pendingIdle  int
 
 	stats Stats
 
-	_closed  uint32 // atomic
-	closedCh chan struct{}
+	minIdleRetryScheduled atomic.Bool
+	minIdleRetryDelay     time.Duration
+
+	closedFlag atomic.Bool
+	closedCh   chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
 var _ Pooler = (*ConnPool)(nil)
 
+// New validates and copies opt, starts optional prewarming and idle reaping,
+// and returns a connection pool. It panics for nil or invalid options.
 func New(opt *Options) *ConnPool {
+	if opt == nil {
+		panic("amqpx: nil connection pool options")
+	}
+	if opt.PoolSize <= 0 {
+		panic("amqpx: connection pool size must be positive")
+	}
+	if opt.MinIdleConns < 0 || opt.MinIdleConns > opt.PoolSize {
+		panic("amqpx: minimum idle connections must be between zero and pool size")
+	}
+	if opt.PoolTimeout < 0 {
+		panic("amqpx: connection pool timeout must not be negative")
+	}
+	if opt.Dialer == nil && opt.DialerContext == nil {
+		panic("amqpx: connection pool requires a dialer")
+	}
+
+	optCopy := *opt
+	opt = &optCopy
+	ctx, cancel := context.WithCancel(context.Background())
 	p := &ConnPool{
 		opt: opt,
 
@@ -99,6 +149,10 @@ func New(opt *Options) *ConnPool {
 		conns:     make([]*Conn, 0, opt.PoolSize),
 		idleConns: make([]*Conn, 0, opt.PoolSize),
 		closedCh:  make(chan struct{}),
+		ctx:       ctx,
+		cancel:    cancel,
+
+		minIdleRetryDelay: defaultMinIdleRetryDelay,
 	}
 
 	p.connsMu.Lock()
@@ -113,61 +167,77 @@ func New(opt *Options) *ConnPool {
 }
 
 func (p *ConnPool) checkMinIdleConns() {
-	if p.opt.MinIdleConns == 0 {
+	if p.opt.MinIdleConns == 0 || p.closed() {
 		return
 	}
-	for p.poolSize < p.opt.PoolSize && p.idleConnsLen < p.opt.MinIdleConns {
-		p.poolSize++
-		p.idleConnsLen++
+	for p.poolSize < p.opt.PoolSize && p.idleConnsLen+p.pendingIdle < p.opt.MinIdleConns {
+		select {
+		case p.queue <- struct{}{}:
+			p.poolSize++
+			p.pendingIdle++
 
-		go func() {
-			err := p.addIdleConn()
-			if err != nil && err != ErrClosed {
-				p.connsMu.Lock()
-				p.poolSize--
-				p.idleConnsLen--
-				p.connsMu.Unlock()
-			}
-		}()
+			go func() {
+				err := p.addIdleConn()
+				retry := false
+				if err != nil {
+					p.connsMu.Lock()
+					if !p.closed() {
+						p.poolSize--
+						p.pendingIdle--
+						retry = true
+					}
+					p.connsMu.Unlock()
+				}
+				p.freeTurn()
+				if retry {
+					p.scheduleMinIdleRetry()
+				}
+			}()
+		default:
+			return
+		}
 	}
 }
 
 func (p *ConnPool) addIdleConn() error {
-	cn, err := p.dialConn(true)
+	cn, err := p.dialConn(p.ctx, true)
 	if err != nil {
 		return err
 	}
 
 	p.connsMu.Lock()
-	defer p.connsMu.Unlock()
-
 	// It is not allowed to add new connections to the closed connection pool.
 	if p.closed() {
-		_ = cn.Close()
+		p.connsMu.Unlock()
+		_ = cn.CloseDeadline(time.Now().Add(discardCloseTimeout))
 		return ErrClosed
 	}
 
 	p.conns = append(p.conns, cn)
 	p.idleConns = append(p.idleConns, cn)
+	p.pendingIdle--
+	p.idleConnsLen++
+	p.connsMu.Unlock()
 	return nil
 }
 
+// NewConn creates an unpooled connection without acquiring a pool turn. The
+// caller can release it with CloseConn, Put, or Remove.
 func (p *ConnPool) NewConn() (*Conn, error) {
-	return p.newConn(false)
+	return p.newConn(p.ctx, false)
 }
 
-func (p *ConnPool) newConn(pooled bool) (*Conn, error) {
-	cn, err := p.dialConn(pooled)
+func (p *ConnPool) newConn(ctx context.Context, pooled bool) (*Conn, error) {
+	cn, err := p.dialConn(ctx, pooled)
 	if err != nil {
 		return nil, err
 	}
 
 	p.connsMu.Lock()
-	defer p.connsMu.Unlock()
-
 	// It is not allowed to add new connections to the closed connection pool.
 	if p.closed() {
-		_ = cn.Close()
+		p.connsMu.Unlock()
+		_ = cn.CloseDeadline(time.Now().Add(discardCloseTimeout))
 		return nil, ErrClosed
 	}
 
@@ -180,31 +250,59 @@ func (p *ConnPool) newConn(pooled bool) (*Conn, error) {
 			p.poolSize++
 		}
 	}
+	p.connsMu.Unlock()
 
 	return cn, nil
 }
 
-func (p *ConnPool) dialConn(pooled bool) (*Conn, error) {
+func (p *ConnPool) dialConn(ctx context.Context, pooled bool) (*Conn, error) {
 	if p.closed() {
 		return nil, ErrClosed
 	}
 
-	if atomic.LoadUint32(&p.dialErrorsNum) >= uint32(p.opt.PoolSize) {
+	if p.dialErrorsNum.Load() >= uint32(p.opt.PoolSize) {
 		return nil, p.getLastDialError()
 	}
 
-	amqpConn, amqpCh, err := p.opt.Dialer()
+	amqpConn, amqpCh, err := p.dial(ctx)
 	if err != nil {
+		if p.closed() {
+			return nil, ErrClosed
+		}
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+		}
 		p.setLastDialError(err)
-		if atomic.AddUint32(&p.dialErrorsNum, 1) == uint32(p.opt.PoolSize) {
+		if p.dialErrorsNum.Add(1) == uint32(p.opt.PoolSize) {
 			go p.tryDial()
 		}
 		return nil, err
 	}
+	p.dialErrorsNum.Store(0)
 
 	cn := NewConn(amqpConn, amqpCh)
 	cn.pooled = pooled
 	return cn, nil
+}
+
+func (p *ConnPool) dial(ctx context.Context) (*amqp.Connection, *amqp.Channel, error) {
+	if p.opt.DialerContext == nil {
+		return p.opt.Dialer()
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	dialCtx, cancel := context.WithCancel(ctx)
+	stopPoolCancel := context.AfterFunc(p.ctx, cancel)
+	defer func() {
+		stopPoolCancel()
+		cancel()
+	}()
+
+	return p.opt.DialerContext(dialCtx)
 }
 
 func (p *ConnPool) tryDial() {
@@ -213,15 +311,24 @@ func (p *ConnPool) tryDial() {
 			return
 		}
 
-		conn, _, err := p.opt.Dialer()
+		conn, _, err := p.dial(p.ctx)
 		if err != nil {
+			if p.closed() {
+				return
+			}
 			p.setLastDialError(err)
-			time.Sleep(time.Second)
+			timer := time.NewTimer(time.Second)
+			select {
+			case <-timer.C:
+			case <-p.closedCh:
+				timer.Stop()
+				return
+			}
 			continue
 		}
 
-		atomic.StoreUint32(&p.dialErrorsNum, 0)
-		_ = conn.Close()
+		p.dialErrorsNum.Store(0)
+		_ = conn.CloseDeadline(time.Now().Add(discardCloseTimeout))
 		return
 	}
 }
@@ -238,7 +345,8 @@ func (p *ConnPool) getLastDialError() error {
 	return nil
 }
 
-// Get returns existed connection from the pool or creates a new one.
+// Get returns an idle connection or creates a new one. A successful checkout
+// owns one pool turn until exactly one Put, Remove, or CloseConn call.
 func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 	if p.closed() {
 		return nil, ErrClosed
@@ -254,6 +362,7 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 		p.connsMu.Unlock()
 
 		if err != nil {
+			p.freeTurn()
 			return nil, err
 		}
 
@@ -262,65 +371,94 @@ func (p *ConnPool) Get(ctx context.Context) (*Conn, error) {
 		}
 
 		if cn.IsClosed() {
-			_ = p.CloseConn(cn)
+			p.discardPoppedConn(ctx, cn)
 			continue
 		}
 
 		if p.isStaleConn(cn) {
-			_ = p.CloseConn(cn)
+			p.discardPoppedConn(ctx, cn)
 			continue
 		}
 
 		atomic.AddUint32(&p.stats.Hits, 1)
+		cn.activateLease()
 		return cn, nil
 	}
 
 	atomic.AddUint32(&p.stats.Misses, 1)
 
-	newcn, err := p.newConn(true)
+	newcn, err := p.newConn(ctx, true)
 	if err != nil {
 		p.freeTurn()
+		p.maintainMinIdleConns()
 		return nil, err
 	}
 
+	newcn.activateLease()
 	return newcn, nil
 }
 
-func (p *ConnPool) getTurn() {
-	p.queue <- struct{}{}
+func (p *ConnPool) getTurn() error {
+	if p.closed() {
+		return ErrClosed
+	}
+
+	select {
+	case p.queue <- struct{}{}:
+		if p.closed() {
+			p.freeTurn()
+			return ErrClosed
+		}
+		return nil
+	case <-p.closedCh:
+		return ErrClosed
+	}
 }
 
 func (p *ConnPool) waitTurn(ctx context.Context) error {
+	if p.closed() {
+		return ErrClosed
+	}
+
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-p.closedCh:
+		return ErrClosed
 	default:
 	}
 
 	select {
 	case p.queue <- struct{}{}:
+		if p.closed() {
+			p.freeTurn()
+			return ErrClosed
+		}
 		return nil
+	case <-p.closedCh:
+		return ErrClosed
 	default:
 	}
 
 	timer := timers.Get().(*time.Timer)
 	timer.Reset(p.opt.PoolTimeout)
+	defer timers.Put(timer)
 
 	select {
 	case <-ctx.Done():
-		if !timer.Stop() {
-			<-timer.C
-		}
-		timers.Put(timer)
+		timer.Stop()
 		return ctx.Err()
+	case <-p.closedCh:
+		timer.Stop()
+		return ErrClosed
 	case p.queue <- struct{}{}:
-		if !timer.Stop() {
-			<-timer.C
+		timer.Stop()
+		if p.closed() {
+			p.freeTurn()
+			return ErrClosed
 		}
-		timers.Put(timer)
 		return nil
 	case <-timer.C:
-		timers.Put(timer)
 		atomic.AddUint32(&p.stats.Timeouts, 1)
 		return ErrPoolTimeout
 	}
@@ -343,10 +481,12 @@ func (p *ConnPool) popIdle() (*Conn, error) {
 	if p.opt.PoolFIFO {
 		cn = p.idleConns[0]
 		copy(p.idleConns, p.idleConns[1:])
+		p.idleConns[n-1] = nil
 		p.idleConns = p.idleConns[:n-1]
 	} else {
 		idx := n - 1
 		cn = p.idleConns[idx]
+		p.idleConns[idx] = nil
 		p.idleConns = p.idleConns[:idx]
 	}
 	p.idleConnsLen--
@@ -354,54 +494,181 @@ func (p *ConnPool) popIdle() (*Conn, error) {
 	return cn, nil
 }
 
+// Put returns a checked-out connection to the pool. Duplicate returns are
+// ignored. Unpooled connections are removed and closed.
 func (p *ConnPool) Put(ctx context.Context, cn *Conn) {
-	if !cn.pooled {
-		p.Remove(ctx, cn, nil)
+	releaseTurn, firstReturn := cn.releaseLease()
+	if !firstReturn {
 		return
 	}
 
+	if !cn.pooled {
+		removed := p.removeConnWithLock(cn)
+		if releaseTurn {
+			p.freeTurn()
+		}
+		if removed {
+			_ = p.closeConn(cn)
+		}
+		p.maintainMinIdleConns()
+		return
+	}
+
+	var removed bool
 	p.connsMu.Lock()
-	p.idleConns = append(p.idleConns, cn)
-	p.idleConnsLen++
+	if p.closed() || cn.closeStarted.Load() {
+		removed = p.removeConn(cn)
+	} else if p.hasConn(cn) {
+		cn.SetUsedAt(time.Now())
+		p.idleConns = append(p.idleConns, cn)
+		p.idleConnsLen++
+	}
 	p.connsMu.Unlock()
-	p.freeTurn()
+	if releaseTurn {
+		p.freeTurn()
+	}
+	if removed {
+		_ = p.tryCloseConn(cn)
+	}
+	p.maintainMinIdleConns()
 }
 
+// Remove releases a checked-out connection, removes it from the pool, and
+// closes it before returning. Duplicate returns are ignored.
 func (p *ConnPool) Remove(ctx context.Context, cn *Conn, reason error) {
-	p.removeConnWithLock(cn)
-	p.freeTurn()
-	_ = p.closeConn(cn)
+	releaseTurn, firstReturn := cn.releaseLease()
+	if !firstReturn {
+		return
+	}
+
+	removed := p.removeConnWithLock(cn)
+	if releaseTurn {
+		p.freeTurn()
+	}
+	if removed {
+		_ = p.closeConn(cn)
+	}
+	p.maintainMinIdleConns()
 }
 
+// CloseConn removes and closes an active, idle, or unpooled connection. It
+// releases an active connection's pool turn.
 func (p *ConnPool) CloseConn(cn *Conn) error {
-	p.removeConnWithLock(cn)
-	return p.closeConn(cn)
+	releaseTurn, _ := cn.releaseLease()
+	removed := p.removeConnWithLock(cn)
+	if releaseTurn {
+		p.freeTurn()
+	}
+	if !removed {
+		return nil
+	}
+	err := p.closeConn(cn)
+	p.maintainMinIdleConns()
+	return err
 }
 
-func (p *ConnPool) removeConnWithLock(cn *Conn) {
+func (p *ConnPool) removeConnWithLock(cn *Conn) bool {
 	p.connsMu.Lock()
-	p.removeConn(cn)
+	removed := p.removeConn(cn)
 	p.connsMu.Unlock()
+	return removed
 }
 
-func (p *ConnPool) removeConn(cn *Conn) {
+func (p *ConnPool) removeConn(cn *Conn) bool {
 	for i, c := range p.conns {
 		if c == cn {
-			p.conns = append(p.conns[:i], p.conns[i+1:]...)
+			last := len(p.conns) - 1
+			copy(p.conns[i:], p.conns[i+1:])
+			p.conns[last] = nil
+			p.conns = p.conns[:last]
+
+			for idleIndex, idleConn := range p.idleConns {
+				if idleConn == cn {
+					idleLast := len(p.idleConns) - 1
+					copy(p.idleConns[idleIndex:], p.idleConns[idleIndex+1:])
+					p.idleConns[idleLast] = nil
+					p.idleConns = p.idleConns[:idleLast]
+					p.idleConnsLen--
+					break
+				}
+			}
 			if cn.pooled {
 				p.poolSize--
-				p.checkMinIdleConns()
 			}
-			return
+			return true
 		}
 	}
+	return false
+}
+
+func (p *ConnPool) hasConn(cn *Conn) bool {
+	for _, candidate := range p.conns {
+		if candidate == cn {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *ConnPool) maintainMinIdleConns() {
+	if p.closed() {
+		return
+	}
+	p.connsMu.Lock()
+	p.checkMinIdleConns()
+	p.connsMu.Unlock()
+}
+
+func (p *ConnPool) discardPoppedConn(ctx context.Context, cn *Conn) {
+	if p.removeConnWithLock(cn) {
+		p.closeDiscardedConn(ctx, cn)
+	}
+	p.maintainMinIdleConns()
+}
+
+func (p *ConnPool) closeDiscardedConn(ctx context.Context, cn *Conn) {
+	deadline := time.Now().Add(discardCloseTimeout)
+	done := make(chan struct{})
+	go func() {
+		_ = cn.tryCloseForPoolDeadline(p.opt.OnClose, deadline)
+		close(done)
+	}()
+
+	timer := time.NewTimer(discardCloseTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-ctx.Done():
+	case <-p.closedCh:
+	case <-timer.C:
+	}
+}
+
+func (p *ConnPool) scheduleMinIdleRetry() {
+	if p.closed() || !p.minIdleRetryScheduled.CompareAndSwap(false, true) {
+		return
+	}
+
+	go func() {
+		timer := time.NewTimer(p.minIdleRetryDelay)
+		defer timer.Stop()
+
+		select {
+		case <-timer.C:
+			p.minIdleRetryScheduled.Store(false)
+			p.maintainMinIdleConns()
+		case <-p.closedCh:
+			p.minIdleRetryScheduled.Store(false)
+		}
+	}()
 }
 
 func (p *ConnPool) closeConn(cn *Conn) error {
-	if p.opt.OnClose != nil {
-		_ = p.opt.OnClose(cn)
-	}
-	return cn.Close()
+	return cn.closeForPool(p.opt.OnClose)
+}
+
+func (p *ConnPool) tryCloseConn(cn *Conn) error {
+	return cn.tryCloseForPool(p.opt.OnClose)
 }
 
 // Len returns total number of connections.
@@ -420,58 +687,66 @@ func (p *ConnPool) IdleLen() int {
 	return n
 }
 
+// Stats returns a point-in-time snapshot of pool counters.
 func (p *ConnPool) Stats() *Stats {
-	idleLen := p.IdleLen()
+	p.connsMu.Lock()
+	totalLen, idleLen := len(p.conns), p.idleConnsLen
+	p.connsMu.Unlock()
+
 	return &Stats{
 		Hits:     atomic.LoadUint32(&p.stats.Hits),
 		Misses:   atomic.LoadUint32(&p.stats.Misses),
 		Timeouts: atomic.LoadUint32(&p.stats.Timeouts),
 
-		TotalConns: uint32(p.Len()),
+		TotalConns: uint32(totalLen),
 		IdleConns:  uint32(idleLen),
 		StaleConns: atomic.LoadUint32(&p.stats.StaleConns),
 	}
 }
 
 func (p *ConnPool) closed() bool {
-	return atomic.LoadUint32(&p._closed) == 1
+	return p.closedFlag.Load()
 }
 
+// Filter closes connections selected by fn. Predicates and close callbacks run
+// without holding the pool mutex.
 func (p *ConnPool) Filter(fn func(*Conn) bool) error {
 	p.connsMu.Lock()
-	defer p.connsMu.Unlock()
+	conns := append([]*Conn(nil), p.conns...)
+	p.connsMu.Unlock()
 
-	var firstErr error
-	for _, cn := range p.conns {
+	var filterErr error
+	for _, cn := range conns {
 		if fn(cn) {
-			if err := p.closeConn(cn); err != nil && firstErr == nil {
-				firstErr = err
-			}
+			filterErr = errors.Join(filterErr, p.closeConn(cn))
 		}
 	}
-	return firstErr
+	return filterErr
 }
 
+// Close marks the pool closed, cancels context-aware dials, wakes pool waiters,
+// and closes all currently registered connections.
 func (p *ConnPool) Close() error {
-	if !atomic.CompareAndSwapUint32(&p._closed, 0, 1) {
+	if !p.closedFlag.CompareAndSwap(false, true) {
 		return ErrClosed
 	}
 	close(p.closedCh)
+	p.cancel()
 
-	var firstErr error
 	p.connsMu.Lock()
-	for _, cn := range p.conns {
-		if err := p.closeConn(cn); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
+	conns := p.conns
 	p.conns = nil
 	p.poolSize = 0
 	p.idleConns = nil
 	p.idleConnsLen = 0
+	p.pendingIdle = 0
 	p.connsMu.Unlock()
 
-	return firstErr
+	var closeErr error
+	for _, cn := range conns {
+		closeErr = errors.Join(closeErr, p.closeConn(cn))
+	}
+	return closeErr
 }
 
 func (p *ConnPool) reaper(frequency time.Duration) {
@@ -497,10 +772,17 @@ func (p *ConnPool) reaper(frequency time.Duration) {
 	}
 }
 
+// ReapStaleConns removes and closes currently stale idle connections.
 func (p *ConnPool) ReapStaleConns() (int, error) {
 	var n int
+	defer func() {
+		atomic.AddUint32(&p.stats.StaleConns, uint32(n))
+	}()
+
 	for {
-		p.getTurn()
+		if err := p.getTurn(); err != nil {
+			return n, err
+		}
 
 		p.connsMu.Lock()
 		cn := p.reapStaleConn()
@@ -509,31 +791,32 @@ func (p *ConnPool) ReapStaleConns() (int, error) {
 		p.freeTurn()
 
 		if cn != nil {
+			p.maintainMinIdleConns()
 			_ = p.closeConn(cn)
 			n++
 		} else {
 			break
 		}
 	}
-	atomic.AddUint32(&p.stats.StaleConns, uint32(n))
 	return n, nil
 }
 
 func (p *ConnPool) reapStaleConn() *Conn {
-	if len(p.idleConns) == 0 {
-		return nil
+	for index, cn := range p.idleConns {
+		if !p.isStaleConn(cn) {
+			continue
+		}
+
+		last := len(p.idleConns) - 1
+		copy(p.idleConns[index:], p.idleConns[index+1:])
+		p.idleConns[last] = nil
+		p.idleConns = p.idleConns[:last]
+		p.idleConnsLen--
+		p.removeConn(cn)
+		return cn
 	}
 
-	cn := p.idleConns[0]
-	if !p.isStaleConn(cn) {
-		return nil
-	}
-
-	p.idleConns = append(p.idleConns[:0], p.idleConns[1:]...)
-	p.idleConnsLen--
-	p.removeConn(cn)
-
-	return cn
+	return nil
 }
 
 func (p *ConnPool) isStaleConn(cn *Conn) bool {
