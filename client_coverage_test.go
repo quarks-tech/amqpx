@@ -45,7 +45,7 @@ func newCoverageClient(t *testing.T, cfg *Config) *Client {
 		},
 	})
 	// The zero-value upstream connection is an intentionally inert test double:
-	// amqp091-go v1.12 cannot close it because its lifecycle is uninitialized.
+	// amqp091-go cannot close it because its lifecycle is uninitialized.
 	// This pool starts no background workers and owns no external resources.
 	return &Client{config: cfg, connPool: pool}
 }

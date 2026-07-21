@@ -53,6 +53,20 @@ func NewClient(config *Config) *Client {
 
 func cloneAMQPConfig(cfg amqp.Config) amqp.Config {
 	cfg.SASL = slices.Clone(cfg.SASL)
+	for i, authentication := range cfg.SASL {
+		switch authentication := authentication.(type) {
+		case *amqp.PlainAuth:
+			if authentication != nil {
+				clone := *authentication
+				cfg.SASL[i] = &clone
+			}
+		case *amqp.AMQPlainAuth:
+			if authentication != nil {
+				clone := *authentication
+				cfg.SASL[i] = &clone
+			}
+		}
+	}
 	cfg.Properties = maps.Clone(cfg.Properties)
 	if cfg.TLSClientConfig != nil {
 		cfg.TLSClientConfig = cfg.TLSClientConfig.Clone()

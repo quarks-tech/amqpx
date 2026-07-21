@@ -267,7 +267,7 @@ func TestNewClientSnapshotsConfig(t *testing.T) {
 }
 
 func TestNewClientClonesMutableAMQPConfigContainers(t *testing.T) {
-	auth := &amqp.PlainAuth{Username: "original"}
+	auth := &amqp.PlainAuth{Username: "original", Password: "secret"}
 	tlsConfig := &tls.Config{ServerName: "original.example"}
 	cfg := &Config{AMQP: amqp.Config{
 		SASL:            []amqp.Authentication{auth},
@@ -278,12 +278,18 @@ func TestNewClientClonesMutableAMQPConfigContainers(t *testing.T) {
 	client := NewClient(cfg)
 	t.Cleanup(func() { _ = client.Close() })
 
+	auth.Username = "changed"
+	auth.Password = ""
 	cfg.AMQP.SASL[0] = &amqp.PlainAuth{Username: "changed"}
 	cfg.AMQP.Properties["product"] = "changed"
 	cfg.AMQP.TLSClientConfig.ServerName = "changed.example"
 
-	if client.config.AMQP.SASL[0] != auth {
-		t.Fatal("client SASL slice changed with caller slice")
+	clientAuth := client.config.AMQP.SASL[0].(*amqp.PlainAuth)
+	if clientAuth == auth {
+		t.Fatal("client retained caller PlainAuth pointer")
+	}
+	if clientAuth.Username != "original" || clientAuth.Password != "secret" {
+		t.Fatalf("client PlainAuth = %+v, want original credentials", clientAuth)
 	}
 	if got := client.config.AMQP.Properties["product"]; got != "original" {
 		t.Fatalf("client property = %v, want original", got)
@@ -298,25 +304,54 @@ func TestNewClientClonesMutableAMQPConfigContainers(t *testing.T) {
 
 func TestCloneAMQPConfigProducesIndependentContainers(t *testing.T) {
 	base := amqp.Config{
-		SASL:            []amqp.Authentication{&amqp.PlainAuth{Username: "original"}},
+		SASL:            []amqp.Authentication{&amqp.PlainAuth{Username: "original", Password: "secret"}},
 		Properties:      amqp.Table{"product": "original"},
 		TLSClientConfig: &tls.Config{ServerName: "original.example"},
 	}
 	first := cloneAMQPConfig(base)
 	second := cloneAMQPConfig(base)
 
-	first.SASL[0] = &amqp.PlainAuth{Username: "changed"}
+	firstAuth := first.SASL[0].(*amqp.PlainAuth)
+	secondAuth := second.SASL[0].(*amqp.PlainAuth)
+	baseAuth := base.SASL[0].(*amqp.PlainAuth)
+	firstAuth.Password = ""
 	first.Properties["product"] = "changed"
 	first.TLSClientConfig.ServerName = "changed.example"
 
-	if second.SASL[0] != base.SASL[0] {
-		t.Fatal("SASL slice is shared between config clones")
+	if firstAuth == baseAuth || secondAuth == baseAuth || firstAuth == secondAuth {
+		t.Fatal("PlainAuth pointer is shared between config clones")
+	}
+	if got := baseAuth.Password; got != "secret" {
+		t.Fatalf("base PlainAuth password = %q, want it unchanged", got)
+	}
+	if got := secondAuth.Password; got != "secret" {
+		t.Fatalf("second PlainAuth password = %q, want it unchanged", got)
 	}
 	if got := second.Properties["product"]; got != "original" {
 		t.Fatalf("second Properties value = %v, want original", got)
 	}
 	if got := second.TLSClientConfig.ServerName; got != "original.example" {
 		t.Fatalf("second TLS ServerName = %q, want original.example", got)
+	}
+}
+
+func TestCloneAMQPConfigClonesAMQPlainCredentials(t *testing.T) {
+	baseAuth := &amqp.AMQPlainAuth{Username: "original", Password: "secret"}
+	first := cloneAMQPConfig(amqp.Config{SASL: []amqp.Authentication{baseAuth}})
+	second := cloneAMQPConfig(amqp.Config{SASL: []amqp.Authentication{baseAuth}})
+
+	firstAuth := first.SASL[0].(*amqp.AMQPlainAuth)
+	secondAuth := second.SASL[0].(*amqp.AMQPlainAuth)
+	firstAuth.Password = ""
+
+	if firstAuth == baseAuth || secondAuth == baseAuth || firstAuth == secondAuth {
+		t.Fatal("AMQPlainAuth pointer is shared between config clones")
+	}
+	if got := baseAuth.Password; got != "secret" {
+		t.Fatalf("base AMQPlainAuth password = %q, want it unchanged", got)
+	}
+	if got := secondAuth.Password; got != "secret" {
+		t.Fatalf("second AMQPlainAuth password = %q, want it unchanged", got)
 	}
 }
 
