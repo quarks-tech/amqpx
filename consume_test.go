@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"github.com/quarks-tech/amqpx/connpool"
 )
 
 func TestWaitForConsumerStopCancelsConsumerWhenWorkerFails(t *testing.T) {
@@ -329,5 +332,30 @@ func TestRunConsumeLoopHandlerObservesLiveCancellation(t *testing.T) {
 	}
 	if !sawLiveCancel {
 		t.Fatal("handler did not observe the live group cancellation")
+	}
+}
+
+func TestConsumeWithDrainValidatesSpec(t *testing.T) {
+	client := &Client{config: &Config{}}
+	okHandle := func(context.Context, *connpool.Conn, *amqp.Delivery) error { return nil }
+
+	cases := map[string]struct {
+		spec    ConsumeSpec
+		handle  func(context.Context, *connpool.Conn, *amqp.Delivery) error
+		wantSub string
+	}{
+		"empty queue":   {ConsumeSpec{ConsumerTag: "tag", Prefetch: 1}, okHandle, "Queue"},
+		"empty tag":     {ConsumeSpec{Queue: "q", Prefetch: 1}, okHandle, "ConsumerTag"},
+		"zero prefetch": {ConsumeSpec{Queue: "q", ConsumerTag: "tag"}, okHandle, "Prefetch"},
+		"neg prefetch":  {ConsumeSpec{Queue: "q", ConsumerTag: "tag", Prefetch: -1}, okHandle, "Prefetch"},
+		"nil handle":    {ConsumeSpec{Queue: "q", ConsumerTag: "tag", Prefetch: 1}, nil, "handle"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := client.ConsumeWithDrain(context.Background(), tc.spec, tc.handle)
+			if err == nil || !strings.Contains(err.Error(), tc.wantSub) {
+				t.Fatalf("error = %v, want mention of %q", err, tc.wantSub)
+			}
+		})
 	}
 }
