@@ -297,3 +297,37 @@ func TestRunConsumeLoopUnexpectedCloseReturnsEOF(t *testing.T) {
 		t.Fatalf("runConsumeLoop() error = %v, want io.ErrUnexpectedEOF", err)
 	}
 }
+
+// A handler blocked mid-delivery observes the group cancellation LIVE when
+// the watcher fails: handlingStarted gates the broker-error send, so the
+// delivery is always picked up before the watcher can fire — deterministic,
+// leak-free ordering.
+func TestRunConsumeLoopHandlerObservesLiveCancellation(t *testing.T) {
+	deliveries := make(chan amqp.Delivery, 1)
+	deliveries <- amqp.Delivery{DeliveryTag: 1}
+	notifyClose := make(chan *amqp.Error, 1)
+	connErr := &amqp.Error{Code: amqp.ConnectionForced, Reason: "broker restart"}
+
+	handlingStarted := make(chan struct{})
+	go func() {
+		<-handlingStarted
+		notifyClose <- connErr
+	}()
+
+	sawLiveCancel := false
+	err := runConsumeLoop(t.Context(), deliveries, notifyClose,
+		func() error { return nil },
+		func(ctx context.Context, _ *amqp.Delivery) error {
+			close(handlingStarted)
+			<-ctx.Done() // must be woken by the watcher's cancelGroup, not return early
+			sawLiveCancel = true
+			return nil
+		},
+	)
+	if !errors.Is(err, connErr) {
+		t.Fatalf("runConsumeLoop() error = %v, want the broker error", err)
+	}
+	if !sawLiveCancel {
+		t.Fatal("handler did not observe the live group cancellation")
+	}
+}
