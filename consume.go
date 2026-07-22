@@ -46,8 +46,9 @@ func (s ConsumeSpec) validate() error {
 // handle owns ALL per-delivery policy including acknowledgment: amqpx never
 // calls Ack or Reject. Manual acknowledgment is mandatory (the consumer is
 // opened with autoAck=false). handle's ctx is the consume group's context —
-// detached from the shutdown ctx, canceled when the loop is stopping after a
-// failure; check ctx.Err() != nil to skip acknowledging then. A handle error
+// detached from the shutdown ctx, canceled when the broker closes the stream
+// with an error or consumer cancellation fails; check ctx.Err() != nil to
+// skip acknowledging then. A handle error
 // stops the lane: no further deliveries are handled, the remaining buffered
 // ones drain unacknowledged (they redeliver later), and the error is
 // returned wrapped as "amqpx: consume drain: ...". Do not retain conn or d
