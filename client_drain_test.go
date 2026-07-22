@@ -70,6 +70,10 @@ func TestRunCommandWithContextDrainReturnsCommandErrorVerbatim(t *testing.T) {
 	commandStarted := make(chan struct{})
 	cmdErr := errors.New("handler failed mid-drain")
 
+	// Gate the command's return on releaseCommand so cancellation always
+	// lands BEFORE the error is produced — otherwise the command can win the
+	// race and the test exercises the ordinary errCh path, not drain mode.
+	releaseCommand := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
 		result <- runCommandWithContext(
@@ -77,6 +81,7 @@ func TestRunCommandWithContextDrainReturnsCommandErrorVerbatim(t *testing.T) {
 			cancelPolicy{drainTimeout: 5 * time.Second},
 			func() error {
 				close(commandStarted)
+				<-releaseCommand
 				return cmdErr
 			},
 			func(time.Time) error { return nil },
@@ -85,6 +90,17 @@ func TestRunCommandWithContextDrainReturnsCommandErrorVerbatim(t *testing.T) {
 
 	<-commandStarted
 	cancel()
+
+	// Drain mode must be entered before the command produces its error: with
+	// the command still blocked, only ctx.Done() is ready, so no result may
+	// arrive yet.
+	select {
+	case err := <-result:
+		t.Fatalf("returned %v before the command produced its error", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseCommand)
 
 	select {
 	case err := <-result:
@@ -327,5 +343,38 @@ func TestProcessWithDrainRetriesRetryableThenDrains(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2 (one retry then clean drain)", attempts)
+	}
+}
+
+// A retryable-classified error returned DURING drain must pass through
+// verbatim: the shutdown ctx is already canceled, so a retry attempt's
+// backoff sleep would consume the cancellation and substitute
+// context.Canceled for the command's real error — and re-running a command
+// that already drained is wrong regardless.
+func TestProcessWithDrainRetryableErrorDuringDrainReturnsVerbatim(t *testing.T) {
+	client := newDrainTestClient(5 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	attempts := 0
+	commandStarted := make(chan struct{})
+	go func() {
+		<-commandStarted
+		cancel()
+	}()
+
+	err := client.ProcessWithDrain(ctx, func(cmdCtx context.Context, _ *connpool.Conn) error {
+		attempts++
+		close(commandStarted)
+		<-cmdCtx.Done()
+		return io.EOF // retryable-classified, returned mid-drain
+	})
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("ProcessWithDrain() error = %v, want io.EOF verbatim", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("ProcessWithDrain() error = %v, must not be masked by context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 (no retry after drain)", attempts)
 	}
 }

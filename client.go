@@ -267,6 +267,13 @@ func (c *Client) doProcess(ctx context.Context, cmd Command, attempt int, policy
 	if err == nil {
 		return false, nil
 	}
+	// Drain mode after cancellation: never retry. The next attempt's backoff
+	// sleep would consume the canceled ctx and substitute context.Canceled
+	// for the command's verbatim error, and re-running a command that
+	// already drained is wrong regardless — the shutdown is in progress.
+	if policy.drainTimeout != 0 && ctx.Err() != nil {
+		return false, err
+	}
 
 	retry := shouldRetry(err)
 	return retry, err
