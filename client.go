@@ -124,7 +124,7 @@ func (c *Client) releaseConn(ctx context.Context, conn *connpool.Conn, err error
 	}
 }
 
-func (c *Client) withConn(ctx context.Context, fn Command) error {
+func (c *Client) withConn(ctx context.Context, fn Command, policy cancelPolicy) error {
 	conn, err := c.getConn(ctx)
 	if err != nil {
 		return err
@@ -136,7 +136,7 @@ func (c *Client) withConn(ctx context.Context, fn Command) error {
 
 	err = runCommandWithContext(
 		ctx,
-		cancelPolicy{},
+		policy,
 		func() error {
 			return fn(ctx, conn)
 		},
@@ -225,22 +225,43 @@ func closeConnectionWithDeadline(closeConn func(time.Time) error) {
 // Config.MaxRetries times. Context cancellation stops acquisition, backoff, and
 // waiting for a command attempt.
 func (c *Client) Process(ctx context.Context, cmd Command) error {
+	return c.process(ctx, cmd, cancelPolicy{})
+}
+
+// ProcessWithDrain executes cmd like Process, but for long-lived commands
+// (consumers): when ctx cancels mid-command the borrowed connection is NOT
+// closed — the command receives the same, now-canceled ctx, owns its shutdown
+// (stop intake, drain in-flight work, return), and its error is returned
+// verbatim (nil = clean drain). If the command does not return within
+// Config.DrainTimeout of the cancellation, the connection is force-closed as
+// a backstop and the call returns ErrDrainTimeout joined with the context
+// error.
+//
+// A clean drain should return nil, not ctx.Err(): returning the cancellation
+// error makes the release classifier discard a healthy connection. Broker
+// operations performed DURING drain (final acks, dead-letter publishes) must
+// detach from the canceled ctx locally via context.WithoutCancel.
+func (c *Client) ProcessWithDrain(ctx context.Context, cmd Command) error {
+	return c.process(ctx, cmd, cancelPolicy{drainTimeout: c.config.DrainTimeout})
+}
+
+func (c *Client) process(ctx context.Context, cmd Command, policy cancelPolicy) error {
 	for attempt := 0; ; attempt++ {
-		retry, err := c.doProcess(ctx, cmd, attempt)
+		retry, err := c.doProcess(ctx, cmd, attempt, policy)
 		if err == nil || !retry || attempt >= c.config.MaxRetries {
 			return err
 		}
 	}
 }
 
-func (c *Client) doProcess(ctx context.Context, cmd Command, attempt int) (bool, error) {
+func (c *Client) doProcess(ctx context.Context, cmd Command, attempt int, policy cancelPolicy) (bool, error) {
 	if attempt > 0 {
 		if err := sleepWithContext(ctx, c.retryBackoff(attempt)); err != nil {
 			return false, err
 		}
 	}
 
-	err := c.withConn(ctx, cmd)
+	err := c.withConn(ctx, cmd, policy)
 	if err == nil {
 		return false, nil
 	}

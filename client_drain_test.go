@@ -3,8 +3,15 @@ package amqpx
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"runtime"
 	"testing"
 	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+
+	"github.com/quarks-tech/amqpx/connpool"
 )
 
 // Drain mode: after cancellation the command keeps its connection and its
@@ -204,5 +211,121 @@ func TestRunCommandWithContextDrainDoesNotStartAfterCancellation(t *testing.T) {
 	case <-commandCalled:
 		t.Fatal("command started with an already canceled context")
 	default:
+	}
+}
+
+// newDrainTestClient builds a Client over a fake pool whose dialer returns an
+// in-memory connection. Unlike the bare `&amqp.Connection{}` fixture used by
+// other fake-pool tests, the retry test below drives a real bad-connection
+// close (io.EOF -> isBadConnErr -> conn.CloseDeadline), and amqp091-go panics
+// closing a zero-value, never-dialed *amqp.Connection. So this dialer instead
+// returns a real connection over an already-closed net.Pipe peer (same trick
+// as newClosedClientAMQPConnection in client_coverage_test.go), which
+// CloseDeadline can close safely.
+func newDrainTestClient(drainTimeout time.Duration) *Client {
+	cfg := &Config{DrainTimeout: drainTimeout}
+	cfg.complete()
+	return &Client{
+		config: cfg,
+		connPool: connpool.New(&connpool.Options{
+			PoolSize:    1,
+			PoolTimeout: time.Second,
+			Dialer: func() (*amqp.Connection, *amqp.Channel, error) {
+				return newClosedDrainTestAMQPConnection(), nil, nil
+			},
+		}),
+	}
+}
+
+// newClosedDrainTestAMQPConnection dials a real amqp.Connection whose peer is
+// already gone, so it settles into a closed state that CloseDeadline can
+// handle without panicking (see newDrainTestClient).
+func newClosedDrainTestAMQPConnection() *amqp.Connection {
+	client, server := net.Pipe()
+	_ = server.Close()
+
+	conn, _ := amqp.Open(client, amqp.Config{})
+
+	deadline := time.Now().Add(time.Second)
+	for conn != nil && !conn.IsClosed() && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+
+	return conn
+}
+
+// End to end: cancel mid-command → command sees its own canceled ctx, drains,
+// returns nil → ProcessWithDrain returns nil (no ctx.Err substitution).
+func TestProcessWithDrainCleanDrain(t *testing.T) {
+	client := newDrainTestClient(5 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	commandStarted := make(chan struct{})
+	go func() {
+		<-commandStarted
+		cancel()
+	}()
+
+	sawCancel := false
+	err := client.ProcessWithDrain(ctx, func(cmdCtx context.Context, _ *connpool.Conn) error {
+		close(commandStarted)
+		<-cmdCtx.Done() // the command receives the SAME ctx and observes shutdown
+		sawCancel = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ProcessWithDrain() error = %v, want nil (clean drain)", err)
+	}
+	if !sawCancel {
+		t.Fatal("command did not observe the canceled ctx")
+	}
+}
+
+// Pre-canceled ctx: the command never runs (parity with Process).
+func TestProcessWithDrainPreCanceledDoesNotRunCommand(t *testing.T) {
+	client := newDrainTestClient(time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	commandCalled := false
+	err := client.ProcessWithDrain(ctx, func(context.Context, *connpool.Conn) error {
+		commandCalled = true
+		return nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProcessWithDrain() error = %v, want context.Canceled", err)
+	}
+	if commandCalled {
+		t.Fatal("command ran with an already canceled ctx")
+	}
+}
+
+// The shared retry loop still applies: a retryable failure re-runs the
+// command (consumer re-subscribe), and the retried attempt then drains clean.
+func TestProcessWithDrainRetriesRetryableThenDrains(t *testing.T) {
+	client := newDrainTestClient(5 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	attempts := 0
+	secondAttemptStarted := make(chan struct{})
+	go func() {
+		<-secondAttemptStarted
+		cancel()
+	}()
+
+	err := client.ProcessWithDrain(ctx, func(cmdCtx context.Context, _ *connpool.Conn) error {
+		attempts++
+		if attempts == 1 {
+			return io.EOF // retryable per shouldRetry
+		}
+		close(secondAttemptStarted)
+		<-cmdCtx.Done()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ProcessWithDrain() error = %v, want nil", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 (one retry then clean drain)", attempts)
 	}
 }
