@@ -6,6 +6,7 @@ import (
 	"io"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -198,5 +199,112 @@ func TestDrainDeliveriesDoesNotHandleAfterGroupCancellation(t *testing.T) {
 
 	if handled != 0 {
 		t.Fatalf("handled deliveries after cancellation = %d, want 0", handled)
+	}
+}
+
+// Clean shutdown: cmdCtx cancels, the watcher cancels the consumer, the
+// broker flushes and closes the stream — nil, no error.
+func TestRunConsumeLoopCleanShutdownReturnsNil(t *testing.T) {
+	cmdCtx, cancel := context.WithCancel(t.Context())
+	deliveries := make(chan amqp.Delivery)
+	var cancelCalled atomic.Bool
+
+	result := make(chan error, 1)
+	go func() {
+		result <- runConsumeLoop(cmdCtx, deliveries, make(chan *amqp.Error),
+			func() error {
+				cancelCalled.Store(true)
+				close(deliveries) // broker closes the stream after Cancel
+				return nil
+			},
+			func(context.Context, *amqp.Delivery) error { return nil },
+		)
+	}()
+
+	cancel()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runConsumeLoop() error = %v, want nil (clean shutdown)", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runConsumeLoop did not return after shutdown drain")
+	}
+	if !cancelCalled.Load() {
+		t.Fatal("consumer was not canceled on shutdown")
+	}
+}
+
+// Handler failure: first error stops handling, the consumer is canceled, the
+// remaining deliveries drain unhandled, and the handler's error is returned.
+func TestRunConsumeLoopReturnsHandlerErrorAndDrains(t *testing.T) {
+	deliveries := make(chan amqp.Delivery, 3)
+	deliveries <- amqp.Delivery{DeliveryTag: 1}
+	deliveries <- amqp.Delivery{DeliveryTag: 2}
+	deliveries <- amqp.Delivery{DeliveryTag: 3}
+
+	wantErr := errors.New("ack failed")
+	handled := 0
+	err := runConsumeLoop(t.Context(), deliveries, make(chan *amqp.Error),
+		func() error {
+			close(deliveries) // Cancel completes because draining continues
+			return nil
+		},
+		func(context.Context, *amqp.Delivery) error {
+			handled++
+			return wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("runConsumeLoop() error = %v, want the handler's error", err)
+	}
+	if handled != 1 {
+		t.Fatalf("handled = %d, want 1 (no handling after the first failure)", handled)
+	}
+}
+
+// Watcher failure (broker-initiated close with a real error): the group ctx
+// is canceled — the callback's skip-ack idiom observes it — and the broker
+// error is returned.
+func TestRunConsumeLoopWatcherErrorCancelsGroup(t *testing.T) {
+	deliveries := make(chan amqp.Delivery, 1)
+	notifyClose := make(chan *amqp.Error, 1)
+	connErr := &amqp.Error{Code: amqp.ConnectionForced, Reason: "broker restart"}
+	notifyClose <- connErr
+
+	groupCanceled := make(chan struct{})
+	deliveries <- amqp.Delivery{}
+	go func() {
+		// Give the watcher its error, then close the stream so drain returns.
+		<-groupCanceled
+		close(deliveries)
+	}()
+
+	err := runConsumeLoop(t.Context(), deliveries, notifyClose,
+		func() error { return nil },
+		func(ctx context.Context, _ *amqp.Delivery) error {
+			// Wait for the group ctx to observe the watcher failure.
+			<-ctx.Done()
+			close(groupCanceled)
+			return nil
+		},
+	)
+	if !errors.Is(err, connErr) {
+		t.Fatalf("runConsumeLoop() error = %v, want the broker error", err)
+	}
+}
+
+// Unexpected stream closure (no shutdown, no failure) surfaces
+// io.ErrUnexpectedEOF for the retry loop to classify.
+func TestRunConsumeLoopUnexpectedCloseReturnsEOF(t *testing.T) {
+	deliveries := make(chan amqp.Delivery)
+	close(deliveries)
+
+	err := runConsumeLoop(t.Context(), deliveries, make(chan *amqp.Error),
+		func() error { return nil },
+		func(context.Context, *amqp.Delivery) error { return nil },
+	)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("runConsumeLoop() error = %v, want io.ErrUnexpectedEOF", err)
 	}
 }

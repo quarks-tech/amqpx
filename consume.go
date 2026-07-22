@@ -83,3 +83,40 @@ func drainDeliveries(
 		}
 	}
 }
+
+// runConsumeLoop joins the stop watcher and the drain loop and returns the
+// watcher's error if it failed, else the drain result. It replaces
+// errgroup.WithContext with a plain join so amqpx stays dependency-free:
+// groupCtx is deliberately DETACHED from cmdCtx (in-flight work must not be
+// canceled mid-delivery) and is canceled when the watcher fails — handlers
+// use groupCtx.Err() != nil to skip acknowledging after a failure.
+func runConsumeLoop(
+	cmdCtx context.Context,
+	deliveries <-chan amqp.Delivery,
+	notifyClose <-chan *amqp.Error,
+	cancelConsumer func() error,
+	handle func(ctx context.Context, d *amqp.Delivery) error,
+) error {
+	groupCtx, cancelGroup := context.WithCancelCause(context.Background())
+	defer cancelGroup(nil)
+
+	workerFailed := make(chan struct{})
+	workerDone := make(chan struct{})
+	stopResult := make(chan error, 1)
+
+	go func() {
+		err := waitForConsumerStop(cmdCtx, workerFailed, workerDone, cancelConsumer, notifyClose)
+		if err != nil {
+			cancelGroup(err)
+		}
+		stopResult <- err
+	}()
+
+	drainErr := drainDeliveries(groupCtx, cmdCtx, deliveries, workerFailed, handle)
+	close(workerDone)
+
+	if stopErr := <-stopResult; stopErr != nil {
+		return stopErr
+	}
+	return drainErr
+}
