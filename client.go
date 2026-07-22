@@ -15,8 +15,10 @@ import (
 )
 
 // Command performs one AMQP operation attempt on an exclusively leased
-// connection and channel. A Command must not retain conn after returning and
-// should stop promptly when ctx is canceled.
+// connection and channel. A Command must not retain conn after returning.
+// Under Process it should stop promptly when ctx is canceled; under
+// ProcessWithDrain it owns its shutdown instead — observe ctx, stop intake,
+// drain, and return within Config.DrainTimeout.
 type Command func(ctx context.Context, conn *connpool.Conn) error
 
 // Client executes AMQP commands with connection pooling and bounded retries.

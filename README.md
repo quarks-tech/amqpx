@@ -169,6 +169,16 @@ command must therefore:
 - never start work that continues to use the borrowed connection after the
   command returns.
 
+For long-lived commands (consumers), use `ProcessWithDrain`: cancellation
+does not close the borrowed connection — the command receives the canceled
+context, stops intake, drains in-flight work, and returns (`nil` on a clean
+drain; the connection then returns to the pool). `Config.DrainTimeout`
+(default 30s, negative = wait forever) bounds the drain; at the deadline the
+connection is force-closed and the call returns `ErrDrainTimeout` joined
+with the context error. Two rules for drain commands: return `nil` (not
+`ctx.Err()`) after a clean drain, and detach in-drain broker operations
+(final acks, dead-letter publishes) with `context.WithoutCancel`.
+
 Cancellation bounds how long `Process` waits, but it cannot forcibly stop Go
 code. A command that ignores these rules may continue running after `Process`
 returns; its connection has already been removed from the pool and must not be
