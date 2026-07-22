@@ -263,31 +263,20 @@ func TestRunConsumeLoopReturnsHandlerErrorAndDrains(t *testing.T) {
 	}
 }
 
-// Watcher failure (broker-initiated close with a real error): the group ctx
-// is canceled — the callback's skip-ack idiom observes it — and the broker
-// error is returned.
+// Watcher failure (broker-initiated close with a real error) cancels the
+// group ctx: with no deliveries ever arriving and the stream never closing,
+// the drain loop can ONLY return via groupCtx cancellation — so this test
+// returning at all proves the watcher's error canceled the group, and the
+// broker error must be what comes back.
 func TestRunConsumeLoopWatcherErrorCancelsGroup(t *testing.T) {
-	deliveries := make(chan amqp.Delivery, 1)
+	deliveries := make(chan amqp.Delivery)
 	notifyClose := make(chan *amqp.Error, 1)
 	connErr := &amqp.Error{Code: amqp.ConnectionForced, Reason: "broker restart"}
 	notifyClose <- connErr
 
-	groupCanceled := make(chan struct{})
-	deliveries <- amqp.Delivery{}
-	go func() {
-		// Give the watcher its error, then close the stream so drain returns.
-		<-groupCanceled
-		close(deliveries)
-	}()
-
 	err := runConsumeLoop(t.Context(), deliveries, notifyClose,
 		func() error { return nil },
-		func(ctx context.Context, _ *amqp.Delivery) error {
-			// Wait for the group ctx to observe the watcher failure.
-			<-ctx.Done()
-			close(groupCanceled)
-			return nil
-		},
+		func(context.Context, *amqp.Delivery) error { return nil },
 	)
 	if !errors.Is(err, connErr) {
 		t.Fatalf("runConsumeLoop() error = %v, want the broker error", err)
