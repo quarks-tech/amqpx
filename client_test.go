@@ -704,6 +704,7 @@ func TestRunCommandWithContextDoesNotWaitForStuckCommand(t *testing.T) {
 	go func() {
 		result <- runCommandWithContext(
 			ctx,
+			cancelPolicy{},
 			func() error {
 				close(commandStarted)
 				<-releaseCommand
@@ -746,6 +747,7 @@ func TestRunCommandWithContextDoesNotStartAfterCancellation(t *testing.T) {
 	closeCalled := make(chan struct{}, 1)
 	err := runCommandWithContext(
 		ctx,
+		cancelPolicy{},
 		func() error {
 			commandCalled <- struct{}{}
 			return nil

@@ -27,6 +27,21 @@ type Client struct {
 
 const cancelCloseTimeout = 100 * time.Millisecond
 
+// ErrDrainTimeout reports that a ProcessWithDrain command did not finish
+// within Config.DrainTimeout after its context was canceled; the borrowed
+// connection was force-closed as a backstop. It is returned joined with the
+// context error, so errors.Is(err, context.Canceled) also holds.
+var ErrDrainTimeout = errors.New("amqpx: drain timeout exceeded")
+
+// cancelPolicy selects what happens to the borrowed connection when ctx
+// cancels mid-command. The zero value is abort mode (Process): force-close
+// the connection immediately and return ctx.Err(). A non-zero drainTimeout
+// waits that long for the command to return on its own before the
+// force-close backstop fires; a negative value waits forever.
+type cancelPolicy struct {
+	drainTimeout time.Duration
+}
+
 // NewClient creates a client from a snapshot of config. A nil config selects
 // all defaults. NewClient panics for invalid settings and when the
 // experimental amqp091-go recovery feature is enabled, because recovery is not
@@ -121,6 +136,7 @@ func (c *Client) withConn(ctx context.Context, fn Command) error {
 
 	err = runCommandWithContext(
 		ctx,
+		cancelPolicy{},
 		func() error {
 			return fn(ctx, conn)
 		},
@@ -133,6 +149,7 @@ func (c *Client) withConn(ctx context.Context, fn Command) error {
 
 func runCommandWithContext(
 	ctx context.Context,
+	policy cancelPolicy,
 	run func() error,
 	closeConn func(time.Time) error,
 ) error {
@@ -151,10 +168,40 @@ func runCommandWithContext(
 
 	select {
 	case <-ctx.Done():
+		if policy.drainTimeout != 0 {
+			return drainCommand(ctx.Err(), policy.drainTimeout, errCh, closeConn)
+		}
 		closeConnectionWithDeadline(closeConn)
 		return ctx.Err()
 	case err := <-errCh:
 		return err
+	}
+}
+
+// drainCommand waits for an already-canceled command to finish on its own:
+// the command owns its shutdown (observe ctx, stop intake, drain, return)
+// and its error is returned verbatim. A bounded wait force-closes the
+// connection at the deadline as the backstop, so a wedged drain cannot hang
+// shutdown forever; a negative timeout waits forever.
+func drainCommand(
+	ctxErr error,
+	timeout time.Duration,
+	errCh <-chan error,
+	closeConn func(time.Time) error,
+) error {
+	if timeout < 0 {
+		return <-errCh
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-timer.C:
+		closeConnectionWithDeadline(closeConn)
+		return errors.Join(ErrDrainTimeout, ctxErr)
 	}
 }
 
