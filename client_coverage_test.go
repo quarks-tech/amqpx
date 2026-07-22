@@ -248,6 +248,7 @@ func TestRunCommandWithContextSynchronousPaths(t *testing.T) {
 	closeCalls := 0
 	err := runCommandWithContext(
 		context.Background(),
+		cancelPolicy{},
 		func() error { return wantErr },
 		func(time.Time) error {
 			closeCalls++
@@ -263,7 +264,7 @@ func TestRunCommandWithContextSynchronousPaths(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	if err := runCommandWithContext(ctx, func() error { return nil }, func(time.Time) error {
+	if err := runCommandWithContext(ctx, cancelPolicy{}, func() error { return nil }, func(time.Time) error {
 		t.Fatal("successful command closed its connection")
 		return nil
 	}); err != nil {

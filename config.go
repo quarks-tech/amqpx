@@ -56,6 +56,14 @@ type Config struct {
 	// callback cannot itself be interrupted before it returns a transport.
 	DialTimeout time.Duration
 
+	// DrainTimeout bounds how long a ProcessWithDrain command may keep its
+	// borrowed connection after its context is canceled: the command is
+	// expected to observe the cancellation, drain, and return within this
+	// budget, after which the connection is force-closed as a backstop.
+	// Default is 30 seconds; a negative value waits forever. Ignored by
+	// Process (which force-closes on cancellation immediately).
+	DrainTimeout time.Duration
+
 	// Type of connection pool.
 	// true for FIFO pool, false for LIFO pool.
 	// Note that fifo has higher overhead compared to lifo.
@@ -104,6 +112,10 @@ func (c *Config) complete() {
 
 	if c.IdleCheckFrequency == 0 {
 		c.IdleCheckFrequency = time.Minute
+	}
+
+	if c.DrainTimeout == 0 {
+		c.DrainTimeout = 30 * time.Second
 	}
 
 	switch {

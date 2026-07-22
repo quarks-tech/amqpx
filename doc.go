@@ -14,6 +14,13 @@
 // indefinitely for the command goroutine. Commands must honor the supplied
 // context and must not leave work running in the background.
 //
+// ProcessWithDrain inverts the mid-command contract for long-lived commands
+// (consumers): cancellation still stops acquisition and backoff, but a running
+// command keeps its connection and owns its shutdown — it must observe ctx,
+// stop intake, drain in-flight work, and return (nil on a clean drain). If it
+// does not return within Config.DrainTimeout, the connection is force-closed
+// and ErrDrainTimeout is returned joined with the context error.
+//
 // The experimental automatic connection, channel, and topology Recovery
 // feature in amqp091-go v1.13 is not supported. NewClient panics when
 // Config.AMQP.Recovery is non-nil so that amqpx alone owns connection

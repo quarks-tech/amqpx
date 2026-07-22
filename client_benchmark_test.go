@@ -81,6 +81,7 @@ func BenchmarkRunCommandWithContext(b *testing.B) {
 		for b.Loop() {
 			benchmarkError = runCommandWithContext(
 				context.Background(),
+				cancelPolicy{},
 				func() error { return nil },
 				func(time.Time) error { return nil },
 			)
@@ -94,6 +95,7 @@ func BenchmarkRunCommandWithContext(b *testing.B) {
 		for b.Loop() {
 			benchmarkError = runCommandWithContext(
 				ctx,
+				cancelPolicy{},
 				func() error { return nil },
 				func(time.Time) error { return nil },
 			)
