@@ -184,6 +184,29 @@ code. A command that ignores these rules may continue running after `Process`
 returns; its connection has already been removed from the pool and must not be
 used.
 
+### Consuming
+
+`ConsumeWithDrain` is the consumer loop over `ProcessWithDrain`: it opens the
+consumer (`Qos` + `Consume`, manual acknowledgment only), delivers each
+message to your handler, and on ctx cancellation cancels the consumer and
+drains buffered deliveries before releasing the connection —
+`Config.DrainTimeout` bounds the drain. The handler owns all policy,
+including `Ack`/`Reject`; its ctx is canceled when the loop is stopping
+after a failure (check `ctx.Err()` to skip acknowledging then). Retryable
+failures — a broker restart closing the stream, retryable AMQP errors —
+re-subscribe through the retry loop up to `Config.MaxRetries`.
+
+    err := client.ConsumeWithDrain(ctx, amqpx.ConsumeSpec{
+        Queue:       "orders",
+        ConsumerTag: "orders-worker-1",
+        Prefetch:    10,
+    }, func(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery) error {
+        if err := process(d); err != nil {
+            return d.Reject(true)
+        }
+        return d.Ack(false)
+    })
+
 ## Connection ownership and concurrency
 
 The `*connpool.Conn` and the `*amqp.Channel` returned by `Conn.Channel` are
