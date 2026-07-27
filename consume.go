@@ -43,16 +43,22 @@ func (s ConsumeSpec) validate() error {
 // errors from NotifyClose — re-subscribe through the usual retry loop up to
 // Config.MaxRetries.
 //
-// handle owns ALL per-delivery policy including acknowledgment: amqpx never
-// calls Ack or Reject. Manual acknowledgment is mandatory (the consumer is
-// opened with autoAck=false). handle's ctx is the consume group's context —
-// detached from the shutdown ctx, canceled when the broker closes the stream
-// with an error or consumer cancellation fails; check ctx.Err() != nil to
-// skip acknowledging then. A handle error
-// stops the lane: no further deliveries are handled, the remaining buffered
-// ones drain unacknowledged (they redeliver later), and the error is
-// returned wrapped as "amqpx: consume drain: ...". Do not retain conn or d
-// after returning (the Command contract).
+// handle owns ALL per-delivery policy including acknowledgment for every delivery
+// it RECEIVES: amqpx never calls Ack or Reject on those. Manual acknowledgment is
+// mandatory (the consumer is opened with autoAck=false). handle's ctx is the
+// consume group's context — detached from the shutdown ctx, canceled when the
+// broker closes the stream with an error or consumer cancellation fails; check
+// ctx.Err() != nil to skip acknowledging then.
+//
+// A handle error stops the lane: no further deliveries are handled, and the error
+// is returned wrapped as "amqpx: consume drain: ...". The already-prefetched
+// deliveries that handle therefore never sees are REQUEUED (Nack with requeue), so
+// they redeliver promptly instead of sitting unacked on a channel that goes back to
+// the connection pool — see drainDeliveries. The delivery whose own handle call
+// failed is not among them: handle received it, so its disposition remains handle's
+// to complete or to leave for redelivery.
+//
+// Do not retain conn or d after returning (the Command contract).
 func (c *Client) ConsumeWithDrain(ctx context.Context, spec ConsumeSpec,
 	handle func(ctx context.Context, conn *connpool.Conn, d *amqp.Delivery) error) error {
 	if err := spec.validate(); err != nil {
@@ -135,6 +141,18 @@ func waitForConsumerStop(
 // closed stream returns io.ErrUnexpectedEOF — deliberately: shouldRetry
 // classifies it retryable, which is what re-subscribes a consumer after a
 // broker restart.
+//
+// Every delivery the drain declines to hand to handle is REQUEUED before the loop
+// moves on. Those deliveries were prefetched, so the broker already considers them
+// outstanding; reading one and returning without acknowledging it leaves it unacked
+// on the channel, and a handle error is not classified retryable, so the connection
+// goes back to the pool with its single long-lived channel still holding them. They
+// are then invisible to every consumer until that pooled connection happens to be
+// torn down — an unbounded stall rather than the prompt redelivery a caller would
+// expect. Requeueing makes the redelivery immediate and explicit.
+//
+// This does not intrude on handle's ownership of acknowledgment: it applies only to
+// deliveries handle never receives.
 func drainDeliveries(
 	groupCtx context.Context,
 	shutdownCtx context.Context,
@@ -160,10 +178,14 @@ func drainDeliveries(
 				}
 			}
 			if groupCtx.Err() != nil {
+				requeue(&delivery)
+
 				return handleErr
 			}
 
 			if handleErr != nil {
+				requeue(&delivery)
+
 				continue
 			}
 
@@ -173,6 +195,17 @@ func drainDeliveries(
 			}
 		}
 	}
+}
+
+// requeue hands a delivery back to the broker for immediate redelivery.
+//
+// Best-effort by design: the only reason Nack fails here is a channel that is
+// already gone, and a closed channel requeues every unacked delivery on it
+// broker-side anyway — the two paths reach the same place. There is nothing an
+// error return could usefully do that the caller is not already doing (it is
+// returning the failure that started the drain).
+func requeue(d *amqp.Delivery) {
+	_ = d.Nack(false, true)
 }
 
 // runConsumeLoop joins the stop watcher and the drain loop and returns the

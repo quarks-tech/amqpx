@@ -159,6 +159,163 @@ func TestDrainDeliveriesSignalsFailureAndContinuesDraining(t *testing.T) {
 	}
 }
 
+// recordingAcknowledger records each delivery's disposition so a drain can be
+// checked for deliveries it consumed without accounting for them.
+type recordingAcknowledger struct {
+	acked    []uint64
+	nacked   []uint64
+	rejected []uint64
+	requeued []uint64
+}
+
+func (a *recordingAcknowledger) Ack(tag uint64, _ bool) error {
+	a.acked = append(a.acked, tag)
+	return nil
+}
+
+func (a *recordingAcknowledger) Nack(tag uint64, _, requeue bool) error {
+	a.nacked = append(a.nacked, tag)
+	if requeue {
+		a.requeued = append(a.requeued, tag)
+	}
+	return nil
+}
+
+func (a *recordingAcknowledger) Reject(tag uint64, requeue bool) error {
+	a.rejected = append(a.rejected, tag)
+	if requeue {
+		a.requeued = append(a.requeued, tag)
+	}
+	return nil
+}
+
+// A delivery the drain reads but never hands to handle must be requeued, not
+// silently consumed. Those deliveries are already prefetched, so the broker counts
+// them outstanding; leaving them unacked strands them on a channel that a
+// non-retryable handle error returns to the connection pool, invisible to every
+// consumer until that connection is torn down.
+func TestDrainDeliveriesRequeuesDeliveriesItDoesNotHandle(t *testing.T) {
+	ack := &recordingAcknowledger{}
+
+	deliveries := make(chan amqp.Delivery, 4)
+	for tag := uint64(1); tag <= 4; tag++ {
+		deliveries <- amqp.Delivery{DeliveryTag: tag, Acknowledger: ack}
+	}
+	close(deliveries)
+
+	wantErr := errors.New("handle failed")
+	err := drainDeliveries(
+		t.Context(),
+		t.Context(),
+		deliveries,
+		make(chan struct{}),
+		func(context.Context, *amqp.Delivery) error { return wantErr },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("drainDeliveries() error = %v, want %v", err, wantErr)
+	}
+
+	// Tag 1 reached handle, so its disposition is handle's to own; 2-4 never did.
+	if len(ack.requeued) != 3 {
+		t.Fatalf("requeued = %v, want the 3 unhandled deliveries (2, 3, 4)", ack.requeued)
+	}
+	for i, tag := range []uint64{2, 3, 4} {
+		if ack.requeued[i] != tag {
+			t.Fatalf("requeued = %v, want [2 3 4]", ack.requeued)
+		}
+	}
+	if len(ack.acked) != 0 || len(ack.rejected) != 0 {
+		t.Fatalf("amqpx acked/rejected on handle's behalf: acked=%v rejected=%v", ack.acked, ack.rejected)
+	}
+}
+
+// The same guarantee on the cancellation path: a delivery taken off the channel and
+// then abandoned because the group is stopping is just as stranded as one abandoned
+// after a failure.
+//
+// Both select cases are ready, so the loop may take either. Assert the invariant per
+// run — a delivery is either still queued or requeued, never silently consumed — and
+// repeat so the dequeuing branch is certain to occur; a conditional assertion would
+// pass on roughly half of all runs with the requeue removed.
+func TestDrainDeliveriesRequeuesOnGroupCancellation(t *testing.T) {
+	const runs = 200
+
+	dequeued := 0
+
+	for i := range runs {
+		ack := &recordingAcknowledger{}
+
+		groupCtx, cancelGroup := context.WithCancel(t.Context())
+		cancelGroup()
+
+		deliveries := make(chan amqp.Delivery, 1)
+		deliveries <- amqp.Delivery{DeliveryTag: 7, Acknowledger: ack}
+
+		_ = drainDeliveries(
+			groupCtx,
+			t.Context(),
+			deliveries,
+			make(chan struct{}),
+			func(context.Context, *amqp.Delivery) error {
+				t.Fatal("handler called after group cancellation")
+				return nil
+			},
+		)
+
+		if len(deliveries) == 1 {
+			if len(ack.requeued) != 0 {
+				t.Fatalf("run %d: delivery left queued AND requeued (%v): it would be delivered twice", i, ack.requeued)
+			}
+			continue
+		}
+
+		dequeued++
+		if len(ack.requeued) != 1 || ack.requeued[0] != 7 {
+			t.Fatalf("run %d: delivery was taken off the channel but requeued = %v, want [7]", i, ack.requeued)
+		}
+	}
+
+	if dequeued == 0 {
+		t.Skipf("the dequeuing branch was never taken across %d runs; the requeue path went unexercised", runs)
+	}
+}
+
+// A clean drain must not requeue anything: every delivery reaches handle, which owns
+// the disposition.
+func TestDrainDeliveriesRequeuesNothingOnCleanDrain(t *testing.T) {
+	ack := &recordingAcknowledger{}
+
+	deliveries := make(chan amqp.Delivery, 3)
+	for tag := uint64(1); tag <= 3; tag++ {
+		deliveries <- amqp.Delivery{DeliveryTag: tag, Acknowledger: ack}
+	}
+	close(deliveries)
+
+	handled := 0
+	err := drainDeliveries(
+		t.Context(),
+		t.Context(),
+		deliveries,
+		make(chan struct{}),
+		func(_ context.Context, d *amqp.Delivery) error {
+			handled++
+			return d.Ack(false)
+		},
+	)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("drainDeliveries() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if handled != 3 {
+		t.Fatalf("handled = %d, want 3", handled)
+	}
+	if len(ack.requeued) != 0 {
+		t.Fatalf("requeued = %v on a clean drain, want none", ack.requeued)
+	}
+	if len(ack.acked) != 3 {
+		t.Fatalf("acked = %v, want all three handled by handle", ack.acked)
+	}
+}
+
 func TestDrainDeliveriesReturnsUnexpectedEOFWhenStreamCloses(t *testing.T) {
 	deliveries := make(chan amqp.Delivery)
 	close(deliveries)
